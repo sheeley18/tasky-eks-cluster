@@ -1,21 +1,51 @@
-# Copyright (c) HashiCorp, Inc.
-# SPDX-License-Identifier: MPL-2.0
-
 provider "aws" {
   region = var.region
 }
 
-# Filter out local zones, which are not currently supported 
-# with managed node groups
-data "aws_availability_zones" "available" {
-  filter {
-    name   = "opt-in-status"
-    values = ["opt-in-not-required"]
-  }
+resource "aws_vpc" "new_vpc" {
+  cidr_block = "10.0.0.0/16"
+}
+
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.new_vpc.id
+}
+
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.new_vpc.id
+}
+
+resource "aws_route" "public_internet_access" {
+  route_table_id         = aws_route_table.public_rt.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.igw.id
+}
+
+resource "aws_subnet" "public_subnet" {
+  vpc_id                  = aws_vpc.new_vpc.id
+  cidr_block              = "10.0.1.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = "us-east-1a"
+}
+
+resource "aws_route_table_association" "public_subnet_assoc" {
+  subnet_id      = aws_subnet.public_subnet.id
+  route_table_id = aws_route_table.public_rt.id
+}
+
+resource "aws_subnet" "private_subnet_1" {
+  vpc_id            = aws_vpc.new_vpc.id
+  cidr_block = "10.0.4.0/24"
+  availability_zone = "us-east-1a"
+}
+
+resource "aws_subnet" "private_subnet_2" {
+  vpc_id            = aws_vpc.new_vpc.id
+  cidr_block = "10.0.5.0/24"
+  availability_zone = "us-east-1b"
 }
 
 locals {
-  cluster_name = "education-eks-${random_string.suffix.result}"
+  cluster_name = "pse-tasky-eks-${random_string.suffix.result}"
 }
 
 resource "random_string" "suffix" {
@@ -23,29 +53,78 @@ resource "random_string" "suffix" {
   special = false
 }
 
-module "vpc" {
-  source  = "terraform-aws-modules/vpc/aws"
-  version = "5.8.1"
+resource "aws_eip" "nat" {
+  domain = "vpc"
+}
 
-  name = "education-vpc"
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public_subnet.id
+  tags = { Name = "pse-tasky-nat-gateway" }
+}
 
-  cidr = "10.0.0.0/16"
-  azs  = slice(data.aws_availability_zones.available.names, 0, 3)
+resource "aws_route_table" "private_rt" {
+  vpc_id = aws_vpc.new_vpc.id
+  tags = { Name = "pse-tasky-private-rt" }
+}
 
-  private_subnets = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
-  public_subnets  = ["10.0.4.0/24", "10.0.5.0/24", "10.0.6.0/24"]
+resource "aws_route" "private_nat_route" {
+  route_table_id         = aws_route_table.private_rt.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.nat.id
+}
 
-  enable_nat_gateway   = true
-  single_nat_gateway   = true
-  enable_dns_hostnames = true
+resource "aws_route_table_association" "private_subnet_assoc_1" {
+  subnet_id      = aws_subnet.private_subnet_1.id
+  route_table_id = aws_route_table.private_rt.id
+}
 
-  public_subnet_tags = {
-    "kubernetes.io/role/elb" = 1
+resource "aws_route_table_association" "private_subnet_assoc_2" {
+  subnet_id      = aws_subnet.private_subnet_2.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+# Data source to get MongoDB VPC
+data "aws_vpc" "mongodb_vpc" {
+  filter {
+    name   = "tag:Name"
+    values = ["mongo_vpc"]
   }
+}
 
-  private_subnet_tags = {
-    "kubernetes.io/role/internal-elb" = 1
+# Data source to get MongoDB private route table
+data "aws_route_tables" "mongodb_private" {
+  vpc_id = data.aws_vpc.mongodb_vpc.id
+  filter {
+    name   = "association.main"
+    values = ["false"]
   }
+}
+
+# VPC Peering Connection
+resource "aws_vpc_peering_connection" "eks_to_mongodb" {
+  peer_vpc_id = data.aws_vpc.mongodb_vpc.id
+  vpc_id      = aws_vpc.new_vpc.id
+  auto_accept = true
+
+  tags = {
+    Name = "EKS-to-MongoDB-Peering"
+  }
+}
+
+# Route for EKS private subnets to reach MongoDB VPC
+resource "aws_route" "eks_to_mongodb" {
+  route_table_id            = aws_route_table.private_rt.id
+  destination_cidr_block    = "192.168.0.0/16"
+  vpc_peering_connection_id = aws_vpc_peering_connection.eks_to_mongodb.id
+}
+
+# Routes for MongoDB VPC to reach EKS VPC
+resource "aws_route" "mongodb_to_eks" {
+  count                     = length(data.aws_route_tables.mongodb_private.ids)
+  route_table_id            = data.aws_route_tables.mongodb_private.ids[count.index]
+  destination_cidr_block    = "10.0.0.0/16"
+  vpc_peering_connection_id = aws_vpc_peering_connection.eks_to_mongodb.id
 }
 
 module "eks" {
@@ -64,30 +143,24 @@ module "eks" {
     }
   }
 
-  vpc_id     = module.vpc.vpc_id
-  subnet_ids = module.vpc.private_subnets
+  vpc_id     = aws_vpc.new_vpc.id
+  subnet_ids = [aws_subnet.private_subnet_1.id, aws_subnet.private_subnet_2.id]
 
   eks_managed_node_group_defaults = {
     ami_type = "AL2_x86_64"
-
   }
 
   eks_managed_node_groups = {
     one = {
       name = "node-group-1"
-
       instance_types = ["t3.small"]
-
       min_size     = 1
       max_size     = 3
       desired_size = 2
     }
-
     two = {
       name = "node-group-2"
-
       instance_types = ["t3.small"]
-
       min_size     = 1
       max_size     = 2
       desired_size = 1
@@ -95,8 +168,6 @@ module "eks" {
   }
 }
 
-
-# https://aws.amazon.com/blogs/containers/amazon-ebs-csi-driver-is-now-generally-available-in-amazon-eks-add-ons/ 
 data "aws_iam_policy" "ebs_csi_policy" {
   arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
 }
@@ -110,4 +181,73 @@ module "irsa-ebs-csi" {
   provider_url                  = module.eks.oidc_provider
   role_policy_arns              = [data.aws_iam_policy.ebs_csi_policy.arn]
   oidc_fully_qualified_subjects = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
+}
+
+# IAM role for EKS to access Secrets Manager
+resource "aws_iam_role" "eks_secrets_role" {
+  name = "eks-secrets-manager-role-${random_string.suffix.result}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Federated = module.eks.oidc_provider_arn
+        }
+        Condition = {
+          StringEquals = {
+            "${replace(module.eks.oidc_provider, "https://", "")}:sub": "system:serviceaccount:default:tasky-service-account"
+            "${replace(module.eks.oidc_provider, "https://", "")}:aud": "sts.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# Policy to access the MongoDB secrets
+resource "aws_iam_role_policy" "eks_secrets_policy" {
+  name = "eks-secrets-manager-policy"
+  role = aws_iam_role.eks_secrets_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = "arn:aws:secretsmanager:us-east-1:442042553076:secret:tasky/database/credentials-*"
+      }
+    ]
+  })
+}
+
+# Install AWS Secrets Store CSI Driver
+resource "helm_release" "secrets_store_csi_driver" {
+  name       = "secrets-store-csi-driver"
+  repository = "https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts"
+  chart      = "secrets-store-csi-driver"
+  namespace  = "kube-system"
+
+  set {
+    name  = "syncSecret.enabled"
+    value = "true"
+  }
+
+  depends_on = [module.eks]
+}
+
+# Install AWS Secrets Store CSI Driver Provider
+resource "helm_release" "aws_secrets_provider" {
+  name       = "secrets-store-csi-driver-provider-aws"
+  repository = "https://aws.github.io/secrets-store-csi-driver-provider-aws"
+  chart      = "secrets-store-csi-driver-provider-aws"
+  namespace  = "kube-system"
+
+  depends_on = [helm_release.secrets_store_csi_driver]
 }
