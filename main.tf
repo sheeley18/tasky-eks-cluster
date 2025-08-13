@@ -253,7 +253,7 @@ resource "aws_iam_role" "eks_secrets_role" {
     Version = "2012-10-17"
     Statement = [
       {
-        Action = "sts:AssumeRole"
+        Action = "sts:AssumeRoleWithWebIdentity"
         Effect = "Allow"
         Principal = {
           Federated = module.eks.oidc_provider_arn
@@ -269,20 +269,24 @@ resource "aws_iam_role" "eks_secrets_role" {
   })
 }
 
-resource "aws_iam_role_policy" "eks_secrets_policy" {
-  name = "eks-secrets-manager-policy"
-  role = aws_iam_role.eks_secrets_role.id
+resource "aws_iam_role" "eks_secrets_role" {
+  name = "eks-secrets-manager-role-${random_string.suffix.result}"
 
-  policy = jsonencode({
+  assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
+        Action = "sts:AssumeRoleWithWebIdentity"  # This was the problem!
         Effect = "Allow"
-        Action = [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:DescribeSecret"
-        ]
-        Resource = "arn:aws:secretsmanager:us-east-1:442042553076:secret:tasky/database/credentials-8d7xqQ"
+        Principal = {
+          Federated = module.eks.oidc_provider_arn
+        }
+        Condition = {
+          StringEquals = {
+            "${replace(module.eks.oidc_provider, "https://", "")}:sub": "system:serviceaccount:default:tasky-service-account"
+            "${replace(module.eks.oidc_provider, "https://", "")}:aud": "sts.amazonaws.com"
+          }
+        }
       }
     ]
   })
