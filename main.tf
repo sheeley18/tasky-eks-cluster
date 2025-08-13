@@ -2,16 +2,31 @@ provider "aws" {
   region = var.region
 }
 
+# VPC with proper DNS settings
 resource "aws_vpc" "new_vpc" {
-  cidr_block = "10.0.0.0/16"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  
+  tags = {
+    Name = "tasky-eks-vpc"
+  }
 }
 
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.new_vpc.id
+  
+  tags = {
+    Name = "tasky-igw"
+  }
 }
 
 resource "aws_route_table" "public_rt" {
   vpc_id = aws_vpc.new_vpc.id
+  
+  tags = {
+    Name = "tasky-public-rt"
+  }
 }
 
 resource "aws_route" "public_internet_access" {
@@ -20,30 +35,7 @@ resource "aws_route" "public_internet_access" {
   gateway_id             = aws_internet_gateway.igw.id
 }
 
-resource "aws_subnet" "public_subnet" {
-  vpc_id                  = aws_vpc.new_vpc.id
-  cidr_block              = "10.0.1.0/24"
-  map_public_ip_on_launch = true
-  availability_zone       = "us-east-1a"
-}
-
-resource "aws_route_table_association" "public_subnet_assoc" {
-  subnet_id      = aws_subnet.public_subnet.id
-  route_table_id = aws_route_table.public_rt.id
-}
-
-resource "aws_subnet" "private_subnet_1" {
-  vpc_id            = aws_vpc.new_vpc.id
-  cidr_block = "10.0.4.0/24"
-  availability_zone = "us-east-1a"
-}
-
-resource "aws_subnet" "private_subnet_2" {
-  vpc_id            = aws_vpc.new_vpc.id
-  cidr_block = "10.0.5.0/24"
-  availability_zone = "us-east-1b"
-}
-
+# Generate cluster name
 locals {
   cluster_name = "tasky-eks-${random_string.suffix.result}"
 }
@@ -53,24 +45,80 @@ resource "random_string" "suffix" {
   special = false
 }
 
-# Use existing EIP instead of creating new one
-data "aws_eips" "available" {
-  filter {
-    name   = "domain"
-    values = ["vpc"]
+# Public subnet with proper tags
+resource "aws_subnet" "public_subnet" {
+  vpc_id                  = aws_vpc.new_vpc.id
+  cidr_block              = "10.0.1.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = "us-east-1a"
+  
+  tags = {
+    Name                     = "tasky-public-subnet"
+    "kubernetes.io/role/elb" = "1"
+    "kubernetes.io/cluster/${local.cluster_name}" = "owned"
   }
 }
 
-# Use the first available EIP
-resource "aws_nat_gateway" "nat" {
-  allocation_id = data.aws_eips.available.allocation_ids[0]
-  subnet_id     = aws_subnet.public_subnet.id
-  tags = { Name = "tasky-nat-gateway" }
+resource "aws_route_table_association" "public_subnet_assoc" {
+  subnet_id      = aws_subnet.public_subnet.id
+  route_table_id = aws_route_table.public_rt.id
 }
 
+# Private subnets with proper tags
+resource "aws_subnet" "private_subnet_1" {
+  vpc_id            = aws_vpc.new_vpc.id
+  cidr_block        = "10.0.4.0/24"
+  availability_zone = "us-east-1a"
+  
+  tags = {
+    Name                              = "tasky-private-subnet-1"
+    "kubernetes.io/role/internal-elb" = "1"
+    "kubernetes.io/cluster/${local.cluster_name}" = "owned"
+  }
+}
+
+resource "aws_subnet" "private_subnet_2" {
+  vpc_id            = aws_vpc.new_vpc.id
+  cidr_block        = "10.0.5.0/24"
+  availability_zone = "us-east-1b"
+  
+  tags = {
+    Name                              = "tasky-private-subnet-2"
+    "kubernetes.io/role/internal-elb" = "1"
+    "kubernetes.io/cluster/${local.cluster_name}" = "owned"
+  }
+}
+
+# Create NEW EIP instead of using existing one
+resource "aws_eip" "nat_eip" {
+  domain = "vpc"
+  
+  tags = {
+    Name = "tasky-nat-eip"
+  }
+  
+  depends_on = [aws_internet_gateway.igw]
+}
+
+# NAT Gateway with the new EIP
+resource "aws_nat_gateway" "nat" {
+  allocation_id = aws_eip.nat_eip.id
+  subnet_id     = aws_subnet.public_subnet.id
+  
+  tags = {
+    Name = "tasky-nat-gateway"
+  }
+  
+  depends_on = [aws_internet_gateway.igw]
+}
+
+# Private route table
 resource "aws_route_table" "private_rt" {
   vpc_id = aws_vpc.new_vpc.id
-  tags = { Name = "tasky-private-rt" }
+  
+  tags = {
+    Name = "tasky-private-rt"
+  }
 }
 
 resource "aws_route" "private_nat_route" {
@@ -89,12 +137,11 @@ resource "aws_route_table_association" "private_subnet_assoc_2" {
   route_table_id = aws_route_table.private_rt.id
 }
 
-# Data source to get MongoDB VPC by actual ID
+# MongoDB VPC peering (keeping your existing setup)
 data "aws_vpc" "mongodb_vpc" {
-  id = "vpc-0828a5cb74c8482ff"  # Your actual MongoDB VPC ID
+  id = "vpc-0828a5cb74c8482ff"
 }
 
-# Data source to get MongoDB private route table
 data "aws_route_tables" "mongodb_private" {
   vpc_id = data.aws_vpc.mongodb_vpc.id
   filter {
@@ -103,7 +150,6 @@ data "aws_route_tables" "mongodb_private" {
   }
 }
 
-# VPC Peering Connection
 resource "aws_vpc_peering_connection" "eks_to_mongodb" {
   peer_vpc_id = data.aws_vpc.mongodb_vpc.id
   vpc_id      = aws_vpc.new_vpc.id
@@ -114,14 +160,12 @@ resource "aws_vpc_peering_connection" "eks_to_mongodb" {
   }
 }
 
-# Route for EKS private subnets to reach MongoDB VPC
 resource "aws_route" "eks_to_mongodb" {
   route_table_id            = aws_route_table.private_rt.id
   destination_cidr_block    = "192.168.0.0/16"
   vpc_peering_connection_id = aws_vpc_peering_connection.eks_to_mongodb.id
 }
 
-# Routes for MongoDB VPC to reach EKS VPC
 resource "aws_route" "mongodb_to_eks" {
   count                     = length(data.aws_route_tables.mongodb_private.ids)
   route_table_id            = data.aws_route_tables.mongodb_private.ids[count.index]
@@ -129,6 +173,7 @@ resource "aws_route" "mongodb_to_eks" {
   vpc_peering_connection_id = aws_vpc_peering_connection.eks_to_mongodb.id
 }
 
+# Simplified EKS cluster
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
   version = "20.8.5"
@@ -143,33 +188,48 @@ module "eks" {
     aws-ebs-csi-driver = {
       service_account_role_arn = module.irsa-ebs-csi.iam_role_arn
     }
+    vpc-cni = {
+      most_recent = true
+    }
+    coredns = {
+      most_recent = true
+    }
+    kube-proxy = {
+      most_recent = true
+    }
   }
 
   vpc_id     = aws_vpc.new_vpc.id
   subnet_ids = [aws_subnet.private_subnet_1.id, aws_subnet.private_subnet_2.id]
 
   eks_managed_node_group_defaults = {
-    ami_type = "AL2_x86_64"
+    ami_type       = "AL2_x86_64"
+    instance_types = ["t3.small"]
+    disk_size      = 20
   }
 
+  # Start with single node group for faster deployment
   eks_managed_node_groups = {
-    one = {
-      name = "node-group-1"
+    primary = {
+      name = "primary-node-group"
       instance_types = ["t3.small"]
+      
       min_size     = 1
       max_size     = 3
       desired_size = 2
+      
+      # Ensure proper subnet distribution
+      subnet_ids = [aws_subnet.private_subnet_1.id, aws_subnet.private_subnet_2.id]
     }
-    two = {
-      name = "node-group-2"
-      instance_types = ["t3.small"]
-      min_size     = 1
-      max_size     = 2
-      desired_size = 1
-    }
+  }
+  
+  tags = {
+    Environment = "dev"
+    Terraform   = "true"
   }
 }
 
+# EBS CSI Driver IAM role
 data "aws_iam_policy" "ebs_csi_policy" {
   arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
 }
@@ -185,7 +245,7 @@ module "irsa-ebs-csi" {
   oidc_fully_qualified_subjects = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
 }
 
-# IAM role for EKS to access Secrets Manager
+# Secrets Manager IAM role
 resource "aws_iam_role" "eks_secrets_role" {
   name = "eks-secrets-manager-role-${random_string.suffix.result}"
 
@@ -209,7 +269,6 @@ resource "aws_iam_role" "eks_secrets_role" {
   })
 }
 
-# Policy to access the MongoDB secrets
 resource "aws_iam_role_policy" "eks_secrets_policy" {
   name = "eks-secrets-manager-policy"
   role = aws_iam_role.eks_secrets_role.id
@@ -229,44 +288,13 @@ resource "aws_iam_role_policy" "eks_secrets_policy" {
   })
 }
 
-# Install AWS Secrets Store CSI Driver
-resource "helm_release" "secrets_store_csi_driver" {
-  name       = "secrets-store-csi-driver"
-  repository = "https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts"
-  chart      = "secrets-store-csi-driver"
-  namespace  = "kube-system"
-
-  set {
-    name  = "syncSecret.enabled"
-    value = "true"
-  }
-
-  depends_on = [module.eks]
-}
-
-# Install AWS Secrets Store CSI Driver Provider
-resource "helm_release" "aws_secrets_provider" {
-  name       = "aws-secrets-provider"
-  repository = "https://aws.github.io/secrets-store-csi-driver-provider-aws"
-  chart      = "secrets-store-csi-driver-provider-aws"
-  namespace  = "kube-system"
-
-  # Use our own ServiceAccount name to avoid conflict
-  set {
-    name  = "serviceAccount.name"
-    value = "aws-secrets-csi-driver"
-  }
-
-  set {
-    name  = "serviceAccount.create"
-    value = "true"
-  }
-
-  # Add annotations to avoid conflicts
-  set {
-    name  = "serviceAccount.annotations.meta\\.helm\\.sh/release-name"
-    value = "aws-secrets-provider"
-  }
-
-  depends_on = [helm_release.secrets_store_csi_driver]
-}
+# Note: Helm charts removed to avoid conflicts
+# Install manually after cluster is ready:
+# 
+# helm repo add secrets-store-csi-driver https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts
+# helm install secrets-store-csi-driver secrets-store-csi-driver/secrets-store-csi-driver \
+#   --namespace kube-system --set syncSecret.enabled=true
+#
+# helm repo add aws-secrets-manager https://aws.github.io/secrets-store-csi-driver-provider-aws  
+# helm install aws-secrets-provider aws-secrets-manager/secrets-store-csi-driver-provider-aws \
+#   --namespace kube-system
