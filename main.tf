@@ -45,7 +45,7 @@ resource "aws_subnet" "private_subnet_2" {
 }
 
 locals {
-  cluster_name = "pse-tasky-eks-${random_string.suffix.result}"
+  cluster_name = "tasky-eks-${random_string.suffix.result}"
 }
 
 resource "random_string" "suffix" {
@@ -60,12 +60,12 @@ resource "aws_eip" "nat" {
 resource "aws_nat_gateway" "nat" {
   allocation_id = aws_eip.nat.id
   subnet_id     = aws_subnet.public_subnet.id
-  tags = { Name = "pse-tasky-nat-gateway" }
+  tags = { Name = "tasky-nat-gateway" }
 }
 
 resource "aws_route_table" "private_rt" {
   vpc_id = aws_vpc.new_vpc.id
-  tags = { Name = "pse-tasky-private-rt" }
+  tags = { Name = "tasky-private-rt" }
 }
 
 resource "aws_route" "private_nat_route" {
