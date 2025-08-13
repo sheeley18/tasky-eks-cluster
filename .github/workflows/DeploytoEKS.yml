@@ -1,127 +1,231 @@
-name: EKS Terraform CI/CD
+provider "aws" {
+  region = var.region
+}
 
-on:
-  push:
-    branches:
-      - '**'  
-  pull_request:
-    branches:
-      - '**'  
+resource "aws_vpc" "new_vpc" {
+  cidr_block = "10.0.0.0/16"
+}
 
-jobs:
-  terraform:
-    name: Terraform Plan and Apply
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-        
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v3
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-          
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: latest
-          
-      - name: Terraform Format Check
-        run: terraform fmt -check
-        continue-on-error: true
-        
-      - name: Terraform Init
-        run: terraform init
-        
-      - name: Terraform Validate
-        run: terraform validate
-        
-      - name: Terraform Plan
-        run: terraform plan -out=tfplan
-        
-      - name: Upload Plan Artifact
-        if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: terraform-plan
-          path: tfplan
-          
-      - name: Comment PR with Plan
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { execSync } = require('child_process');
-            try {
-              const planOutput = execSync('terraform show -no-color tfplan', { encoding: 'utf8' });
-              const comment = `## EKS Terraform Plan
-              
-              <details>
-              <summary>Show Plan</summary>
-              
-              \`\`\`
-              ${planOutput}
-              \`\`\`
-              
-              </details>`;
-              
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: comment
-              });
-            } catch (error) {
-              console.error('Failed to generate plan comment:', error);
-            }
-            
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: terraform apply -auto-approve tfplan
-        
-      - name: Capture Important Outputs
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          echo "## EKS Deployment Complete! 🎉" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Cluster Information" >> $GITHUB_STEP_SUMMARY
-          echo "**Cluster Name:** \`$(terraform output -raw cluster_name)\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Cluster Endpoint:** \`$(terraform output -raw cluster_endpoint)\`" >> $GITHUB_STEP_SUMMARY
-          echo "**Region:** \`$(terraform output -raw region)\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🔑 Important for Tasky Deployment" >> $GITHUB_STEP_SUMMARY
-          echo "**Secrets Manager Role ARN:**" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "$(terraform output -raw eks_secrets_manager_role_arn)" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
-          echo "1. **Configure kubectl:**" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
-          echo "aws eks update-kubeconfig --name $(terraform output -raw cluster_name)" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "2. **Update service-account.yaml in Tasky repo with the Role ARN above**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "3. **Deploy Tasky application**" >> $GITHUB_STEP_SUMMARY
-          
-      - name: Save Outputs for Later Use
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        run: |
-          mkdir -p outputs
-          terraform output -json > outputs/terraform-outputs.json
-          echo "CLUSTER_NAME=$(terraform output -raw cluster_name)" >> outputs/cluster-info.env
-          echo "ROLE_ARN=$(terraform output -raw eks_secrets_manager_role_arn)" >> outputs/cluster-info.env
-          echo "CLUSTER_ENDPOINT=$(terraform output -raw cluster_endpoint)" >> outputs/cluster-info.env
-          echo "VPC_PEERING_ID=$(terraform output -raw vpc_peering_connection_id)" >> outputs/cluster-info.env
-          
-      - name: Upload Deployment Outputs
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        uses: actions/upload-artifact@v4
-        with:
-          name: eks-deployment-outputs
-          path: outputs/
-          retention-days: 30
+resource "aws_internet_gateway" "igw" {
+  vpc_id = aws_vpc.new_vpc.id
+}
+
+resource "aws_route_table" "public_rt" {
+  vpc_id = aws_vpc.new_vpc.id
+}
+
+resource "aws_route" "public_internet_access" {
+  route_table_id         = aws_route_table.public_rt.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.igw.id
+}
+
+# Use public subnets for EKS nodes temporarily
+resource "aws_subnet" "public_subnet_1" {
+  vpc_id                  = aws_vpc.new_vpc.id
+  cidr_block              = "10.0.1.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = "us-east-1a"
+}
+
+resource "aws_subnet" "public_subnet_2" {
+  vpc_id                  = aws_vpc.new_vpc.id
+  cidr_block              = "10.0.2.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = "us-east-1b"
+}
+
+resource "aws_route_table_association" "public_subnet_assoc_1" {
+  subnet_id      = aws_subnet.public_subnet_1.id
+  route_table_id = aws_route_table.public_rt.id
+}
+
+resource "aws_route_table_association" "public_subnet_assoc_2" {
+  subnet_id      = aws_subnet.public_subnet_2.id
+  route_table_id = aws_route_table.public_rt.id
+}
+
+locals {
+  cluster_name = "tasky-eks-${random_string.suffix.result}"
+}
+
+resource "random_string" "suffix" {
+  length  = 8
+  special = false
+}
+
+# Data source to get MongoDB VPC by actual ID
+data "aws_vpc" "mongodb_vpc" {
+  id = "vpc-080f0083329a6c456"  # Your actual MongoDB VPC ID
+}
+
+# Data source to get MongoDB private route table
+data "aws_route_tables" "mongodb_private" {
+  vpc_id = data.aws_vpc.mongodb_vpc.id
+  filter {
+    name   = "association.main"
+    values = ["false"]
+  }
+}
+
+# VPC Peering Connection
+resource "aws_vpc_peering_connection" "eks_to_mongodb" {
+  peer_vpc_id = data.aws_vpc.mongodb_vpc.id
+  vpc_id      = aws_vpc.new_vpc.id
+  auto_accept = true
+
+  tags = {
+    Name = "EKS-to-MongoDB-Peering"
+  }
+}
+
+# Route for EKS public subnets to reach MongoDB VPC
+resource "aws_route" "eks_to_mongodb" {
+  route_table_id            = aws_route_table.public_rt.id
+  destination_cidr_block    = "192.168.0.0/16"
+  vpc_peering_connection_id = aws_vpc_peering_connection.eks_to_mongodb.id
+}
+
+# Routes for MongoDB VPC to reach EKS VPC
+resource "aws_route" "mongodb_to_eks" {
+  count                     = length(data.aws_route_tables.mongodb_private.ids)
+  route_table_id            = data.aws_route_tables.mongodb_private.ids[count.index]
+  destination_cidr_block    = "10.0.0.0/16"
+  vpc_peering_connection_id = aws_vpc_peering_connection.eks_to_mongodb.id
+}
+
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "20.8.5"
+
+  cluster_name    = local.cluster_name
+  cluster_version = "1.29"
+
+  cluster_endpoint_public_access           = true
+  enable_cluster_creator_admin_permissions = true
+
+  cluster_addons = {
+    aws-ebs-csi-driver = {
+      service_account_role_arn = module.irsa-ebs-csi.iam_role_arn
+    }
+  }
+
+  vpc_id     = aws_vpc.new_vpc.id
+  subnet_ids = [aws_subnet.public_subnet_1.id, aws_subnet.public_subnet_2.id]
+
+  eks_managed_node_group_defaults = {
+    ami_type = "AL2_x86_64"
+  }
+
+  eks_managed_node_groups = {
+    one = {
+      name = "node-group-1"
+      instance_types = ["t3.small"]
+      min_size     = 1
+      max_size     = 3
+      desired_size = 2
+    }
+    two = {
+      name = "node-group-2"
+      instance_types = ["t3.small"]
+      min_size     = 1
+      max_size     = 2
+      desired_size = 1
+    }
+  }
+}
+
+data "aws_iam_policy" "ebs_csi_policy" {
+  arn = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+}
+
+module "irsa-ebs-csi" {
+  source  = "terraform-aws-modules/iam/aws//modules/iam-assumable-role-with-oidc"
+  version = "5.39.0"
+
+  create_role                   = true
+  role_name                     = "AmazonEKSTFEBSCSIRole-${module.eks.cluster_name}"
+  provider_url                  = module.eks.oidc_provider
+  role_policy_arns              = [data.aws_iam_policy.ebs_csi_policy.arn]
+  oidc_fully_qualified_subjects = ["system:serviceaccount:kube-system:ebs-csi-controller-sa"]
+}
+
+# IAM role for EKS to access Secrets Manager
+resource "aws_iam_role" "eks_secrets_role" {
+  name = "eks-secrets-manager-role-${random_string.suffix.result}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Federated = module.eks.oidc_provider_arn
+        }
+        Condition = {
+          StringEquals = {
+            "${replace(module.eks.oidc_provider, "https://", "")}:sub": "system:serviceaccount:default:tasky-service-account"
+            "${replace(module.eks.oidc_provider, "https://", "")}:aud": "sts.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# Policy to access the MongoDB secrets
+resource "aws_iam_role_policy" "eks_secrets_policy" {
+  name = "eks-secrets-manager-policy"
+  role = aws_iam_role.eks_secrets_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:DescribeSecret"
+        ]
+        Resource = "arn:aws:secretsmanager:us-east-1:442042553076:secret:tasky/database/credentials-*"
+      }
+    ]
+  })
+}
+
+# Install AWS Secrets Store CSI Driver
+resource "helm_release" "secrets_store_csi_driver" {
+  name       = "secrets-store-csi-driver"
+  repository = "https://kubernetes-sigs.github.io/secrets-store-csi-driver/charts"
+  chart      = "secrets-store-csi-driver"
+  namespace  = "kube-system"
+
+  set {
+    name  = "syncSecret.enabled"
+    value = "true"
+  }
+
+  depends_on = [module.eks]
+}
+
+# Install AWS Secrets Store CSI Driver Provider
+resource "helm_release" "aws_secrets_provider" {
+  name       = "aws-secrets-provider"  # Changed name to avoid conflict
+  repository = "https://aws.github.io/secrets-store-csi-driver-provider-aws"
+  chart      = "secrets-store-csi-driver-provider-aws"
+  namespace  = "kube-system"
+
+  # Don't create the service account since it already exists
+  set {
+    name  = "serviceAccount.create"
+    value = "false"
+  }
+
+  # Force recreation to clear the conflict
+  replace_triggered_by = [
+    helm_release.secrets_store_csi_driver
+  ]
+
+  depends_on = [helm_release.secrets_store_csi_driver]
+}
