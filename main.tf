@@ -20,32 +20,33 @@ resource "aws_route" "public_internet_access" {
   gateway_id             = aws_internet_gateway.igw.id
 }
 
-resource "aws_subnet" "public_subnet" {
+# Use public subnets for EKS nodes temporarily
+resource "aws_subnet" "public_subnet_1" {
   vpc_id                  = aws_vpc.new_vpc.id
   cidr_block              = "10.0.1.0/24"
   map_public_ip_on_launch = true
   availability_zone       = "us-east-1a"
 }
 
-resource "aws_route_table_association" "public_subnet_assoc" {
-  subnet_id      = aws_subnet.public_subnet.id
+resource "aws_subnet" "public_subnet_2" {
+  vpc_id                  = aws_vpc.new_vpc.id
+  cidr_block              = "10.0.2.0/24"
+  map_public_ip_on_launch = true
+  availability_zone       = "us-east-1b"
+}
+
+resource "aws_route_table_association" "public_subnet_assoc_1" {
+  subnet_id      = aws_subnet.public_subnet_1.id
   route_table_id = aws_route_table.public_rt.id
 }
 
-resource "aws_subnet" "private_subnet_1" {
-  vpc_id            = aws_vpc.new_vpc.id
-  cidr_block = "10.0.4.0/24"
-  availability_zone = "us-east-1a"
-}
-
-resource "aws_subnet" "private_subnet_2" {
-  vpc_id            = aws_vpc.new_vpc.id
-  cidr_block = "10.0.5.0/24"
-  availability_zone = "us-east-1b"
+resource "aws_route_table_association" "public_subnet_assoc_2" {
+  subnet_id      = aws_subnet.public_subnet_2.id
+  route_table_id = aws_route_table.public_rt.id
 }
 
 locals {
-  cluster_name = "tasky-eks-${random_string.suffix.result}"
+  cluster_name = "pse-tasky-eks-${random_string.suffix.result}"
 }
 
 resource "random_string" "suffix" {
@@ -53,40 +54,9 @@ resource "random_string" "suffix" {
   special = false
 }
 
-resource "aws_eip" "nat" {
-  domain = "vpc"
-}
-
-resource "aws_nat_gateway" "nat" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.public_subnet.id
-  tags = { Name = "tasky-nat-gateway" }
-}
-
-resource "aws_route_table" "private_rt" {
-  vpc_id = aws_vpc.new_vpc.id
-  tags = { Name = "tasky-private-rt" }
-}
-
-resource "aws_route" "private_nat_route" {
-  route_table_id         = aws_route_table.private_rt.id
-  destination_cidr_block = "0.0.0.0/0"
-  nat_gateway_id         = aws_nat_gateway.nat.id
-}
-
-resource "aws_route_table_association" "private_subnet_assoc_1" {
-  subnet_id      = aws_subnet.private_subnet_1.id
-  route_table_id = aws_route_table.private_rt.id
-}
-
-resource "aws_route_table_association" "private_subnet_assoc_2" {
-  subnet_id      = aws_subnet.private_subnet_2.id
-  route_table_id = aws_route_table.private_rt.id
-}
-
 # Data source to get MongoDB VPC by actual ID
 data "aws_vpc" "mongodb_vpc" {
-  id = "vpc-0828a5cb74c8482ff"  
+  id = "vpc-080f0083329a6c456"  # Your actual MongoDB VPC ID
 }
 
 # Data source to get MongoDB private route table
@@ -109,9 +79,9 @@ resource "aws_vpc_peering_connection" "eks_to_mongodb" {
   }
 }
 
-# Route for EKS private subnets to reach MongoDB VPC
+# Route for EKS public subnets to reach MongoDB VPC
 resource "aws_route" "eks_to_mongodb" {
-  route_table_id            = aws_route_table.private_rt.id
+  route_table_id            = aws_route_table.public_rt.id
   destination_cidr_block    = "192.168.0.0/16"
   vpc_peering_connection_id = aws_vpc_peering_connection.eks_to_mongodb.id
 }
@@ -141,7 +111,7 @@ module "eks" {
   }
 
   vpc_id     = aws_vpc.new_vpc.id
-  subnet_ids = [aws_subnet.private_subnet_1.id, aws_subnet.private_subnet_2.id]
+  subnet_ids = [aws_subnet.public_subnet_1.id, aws_subnet.public_subnet_2.id]
 
   eks_managed_node_group_defaults = {
     ami_type = "AL2_x86_64"
@@ -245,6 +215,12 @@ resource "helm_release" "aws_secrets_provider" {
   repository = "https://aws.github.io/secrets-store-csi-driver-provider-aws"
   chart      = "secrets-store-csi-driver-provider-aws"
   namespace  = "kube-system"
+
+  # Don't create the service account since it already exists
+  set {
+    name  = "serviceAccount.create"
+    value = "false"
+  }
 
   depends_on = [helm_release.secrets_store_csi_driver]
 }
