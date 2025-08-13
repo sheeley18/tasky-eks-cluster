@@ -56,7 +56,7 @@ resource "random_string" "suffix" {
 
 # Data source to get MongoDB VPC by actual ID
 data "aws_vpc" "mongodb_vpc" {
-  id = "vpc-080f0083329a6c456"  # Your actual MongoDB VPC ID
+  id = "vpc-0828a5cb74c8482ff"  # Your actual MongoDB VPC ID
 }
 
 # Data source to get MongoDB private route table
@@ -211,7 +211,7 @@ resource "helm_release" "secrets_store_csi_driver" {
 
 # Install AWS Secrets Store CSI Driver Provider
 resource "helm_release" "aws_secrets_provider" {
-  name       = "secrets-store-csi-driver-provider-aws"
+  name       = "aws-secrets-provider"  # Changed name to avoid conflict
   repository = "https://aws.github.io/secrets-store-csi-driver-provider-aws"
   chart      = "secrets-store-csi-driver-provider-aws"
   namespace  = "kube-system"
@@ -221,6 +221,11 @@ resource "helm_release" "aws_secrets_provider" {
     name  = "serviceAccount.create"
     value = "false"
   }
+
+  # Force recreation to clear the conflict
+  replace_triggered_by = [
+    helm_release.secrets_store_csi_driver
+  ]
 
   depends_on = [helm_release.secrets_store_csi_driver]
 }
