@@ -282,7 +282,7 @@ resource "aws_iam_role_policy" "eks_secrets_policy" {
           "secretsmanager:GetSecretValue",
           "secretsmanager:DescribeSecret"
         ]
-        Resource = "arn:aws:secretsmanager:us-east-1:442042553076:secret:tasky/database/credentials-*"
+        Resource = "arn:aws:secretsmanager:us-east-1:442042553076:secret:tasky/database/credentials-8d7xqQ"
       }
     ]
   })
