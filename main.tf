@@ -46,7 +46,7 @@ resource "aws_route_table_association" "public_subnet_assoc_2" {
 }
 
 locals {
-  cluster_name = "pse-tasky-eks-${random_string.suffix.result}"
+  cluster_name = "tasky-eks-${random_string.suffix.result}"
 }
 
 resource "random_string" "suffix" {
