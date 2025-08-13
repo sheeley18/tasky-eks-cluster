@@ -222,10 +222,5 @@ resource "helm_release" "aws_secrets_provider" {
     value = "false"
   }
 
-  # Force recreation to clear the conflict
-  replace_triggered_by = [
-    helm_release.secrets_store_csi_driver
-  ]
-
   depends_on = [helm_release.secrets_store_csi_driver]
 }
