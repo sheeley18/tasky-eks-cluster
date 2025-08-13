@@ -84,12 +84,9 @@ resource "aws_route_table_association" "private_subnet_assoc_2" {
   route_table_id = aws_route_table.private_rt.id
 }
 
-# Data source to get MongoDB VPC
+# Data source to get MongoDB VPC by actual ID
 data "aws_vpc" "mongodb_vpc" {
-  filter {
-    name   = "tag:Name"
-    values = ["mongo_vpc"]
-  }
+  id = "vpc-0828a5cb74c8482ff"  
 }
 
 # Data source to get MongoDB private route table
