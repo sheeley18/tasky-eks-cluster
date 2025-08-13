@@ -20,29 +20,28 @@ resource "aws_route" "public_internet_access" {
   gateway_id             = aws_internet_gateway.igw.id
 }
 
-# Use public subnets for EKS nodes temporarily
-resource "aws_subnet" "public_subnet_1" {
+resource "aws_subnet" "public_subnet" {
   vpc_id                  = aws_vpc.new_vpc.id
   cidr_block              = "10.0.1.0/24"
   map_public_ip_on_launch = true
   availability_zone       = "us-east-1a"
 }
 
-resource "aws_subnet" "public_subnet_2" {
-  vpc_id                  = aws_vpc.new_vpc.id
-  cidr_block              = "10.0.2.0/24"
-  map_public_ip_on_launch = true
-  availability_zone       = "us-east-1b"
-}
-
-resource "aws_route_table_association" "public_subnet_assoc_1" {
-  subnet_id      = aws_subnet.public_subnet_1.id
+resource "aws_route_table_association" "public_subnet_assoc" {
+  subnet_id      = aws_subnet.public_subnet.id
   route_table_id = aws_route_table.public_rt.id
 }
 
-resource "aws_route_table_association" "public_subnet_assoc_2" {
-  subnet_id      = aws_subnet.public_subnet_2.id
-  route_table_id = aws_route_table.public_rt.id
+resource "aws_subnet" "private_subnet_1" {
+  vpc_id            = aws_vpc.new_vpc.id
+  cidr_block = "10.0.4.0/24"
+  availability_zone = "us-east-1a"
+}
+
+resource "aws_subnet" "private_subnet_2" {
+  vpc_id            = aws_vpc.new_vpc.id
+  cidr_block = "10.0.5.0/24"
+  availability_zone = "us-east-1b"
 }
 
 locals {
@@ -52,6 +51,42 @@ locals {
 resource "random_string" "suffix" {
   length  = 8
   special = false
+}
+
+# Use existing EIP instead of creating new one
+data "aws_eips" "available" {
+  filter {
+    name   = "domain"
+    values = ["vpc"]
+  }
+}
+
+# Use the first available EIP
+resource "aws_nat_gateway" "nat" {
+  allocation_id = data.aws_eips.available.allocation_ids[0]
+  subnet_id     = aws_subnet.public_subnet.id
+  tags = { Name = "tasky-nat-gateway" }
+}
+
+resource "aws_route_table" "private_rt" {
+  vpc_id = aws_vpc.new_vpc.id
+  tags = { Name = "tasky-private-rt" }
+}
+
+resource "aws_route" "private_nat_route" {
+  route_table_id         = aws_route_table.private_rt.id
+  destination_cidr_block = "0.0.0.0/0"
+  nat_gateway_id         = aws_nat_gateway.nat.id
+}
+
+resource "aws_route_table_association" "private_subnet_assoc_1" {
+  subnet_id      = aws_subnet.private_subnet_1.id
+  route_table_id = aws_route_table.private_rt.id
+}
+
+resource "aws_route_table_association" "private_subnet_assoc_2" {
+  subnet_id      = aws_subnet.private_subnet_2.id
+  route_table_id = aws_route_table.private_rt.id
 }
 
 # Data source to get MongoDB VPC by actual ID
@@ -79,9 +114,9 @@ resource "aws_vpc_peering_connection" "eks_to_mongodb" {
   }
 }
 
-# Route for EKS public subnets to reach MongoDB VPC
+# Route for EKS private subnets to reach MongoDB VPC
 resource "aws_route" "eks_to_mongodb" {
-  route_table_id            = aws_route_table.public_rt.id
+  route_table_id            = aws_route_table.private_rt.id
   destination_cidr_block    = "192.168.0.0/16"
   vpc_peering_connection_id = aws_vpc_peering_connection.eks_to_mongodb.id
 }
@@ -111,7 +146,7 @@ module "eks" {
   }
 
   vpc_id     = aws_vpc.new_vpc.id
-  subnet_ids = [aws_subnet.public_subnet_1.id, aws_subnet.public_subnet_2.id]
+  subnet_ids = [aws_subnet.private_subnet_1.id, aws_subnet.private_subnet_2.id]
 
   eks_managed_node_group_defaults = {
     ami_type = "AL2_x86_64"
@@ -211,15 +246,26 @@ resource "helm_release" "secrets_store_csi_driver" {
 
 # Install AWS Secrets Store CSI Driver Provider
 resource "helm_release" "aws_secrets_provider" {
-  name       = "aws-secrets-provider"  # Changed name to avoid conflict
+  name       = "aws-secrets-provider"
   repository = "https://aws.github.io/secrets-store-csi-driver-provider-aws"
   chart      = "secrets-store-csi-driver-provider-aws"
   namespace  = "kube-system"
 
-  # Don't create the service account since it already exists
+  # Use our own ServiceAccount name to avoid conflict
+  set {
+    name  = "serviceAccount.name"
+    value = "aws-secrets-csi-driver"
+  }
+
   set {
     name  = "serviceAccount.create"
-    value = "false"
+    value = "true"
+  }
+
+  # Add annotations to avoid conflicts
+  set {
+    name  = "serviceAccount.annotations.meta\\.helm\\.sh/release-name"
+    value = "aws-secrets-provider"
   }
 
   depends_on = [helm_release.secrets_store_csi_driver]
